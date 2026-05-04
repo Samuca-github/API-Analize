@@ -1,9 +1,15 @@
 // src/services/providers/openai.ts
 import OpenAI from "openai";
 import { parse as parseTLD } from "tldts";
+import {
+  type ClassifierConfidence,
+  type ClassifierLabel,
+  type ClassifierSource,
+  normalizeCategorySlug,
+} from "../../utils/taxonomy.js";
+import { scoreToConfidence } from "../../utils/scoring.js";
 
 const HAS_KEY = !!process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.length > 10;
-const SKIP_SHORT_CIRCUIT = process.env.LLM_SKIP_SHORT_CIRCUIT === "1";
 
 const client = HAS_KEY
   ? new OpenAI({
@@ -18,9 +24,7 @@ if (!HAS_KEY) {
   console.warn("[openai] OPENAI_API_KEY ausente; mlScore vai cair em fallback 0.5");
 }
 
-export type ClassifierLabel = "phishing" | "suspicious" | "benign";
-export type ClassifierConfidence = "low" | "medium" | "high";
-export type ClassifierSource = "gpt" | "short_circuit" | "fallback";
+export type { ClassifierConfidence, ClassifierLabel, ClassifierSource };
 
 export type LLMOutput = {
   score: number;              // 0..1
@@ -145,24 +149,6 @@ function buildFeatures(input: {
   };
 }
 
-function shortCircuitVerdict(feat: ReturnType<typeof buildFeatures>): LLMOutput | null {
-  // ⚡️ regra: autenticação forte + maioria esmagadora dos links de ação na mesma família
-  if (feat.auth.authStrong && (feat.familyMatchRatio >= 0.8 || feat.counts.action_links === 0)) {
-    return {
-      score: 0.18,
-      label: "benign",
-      confidence: "high",
-      categories: [],
-      explanations: [
-        "Autenticação forte (DKIM/DMARC) válida.",
-        "Domínios dos links consistentes com a marca do remetente.",
-      ],
-      source: "short_circuit",
-    };
-  }
-  return null;
-}
-
 // ---------- LLM ----------
 export async function gptPhishingScore(input: {
   subject?: string;
@@ -174,8 +160,12 @@ export async function gptPhishingScore(input: {
   features?: Record<string, any>;
 }): Promise<LLMOutput> {
   const fallback: LLMOutput = {
-    score: 0.5, label: "suspicious", confidence: "low",
-    categories: [], explanations: ["fallback"], source: "fallback"
+    score: 0.5,
+    label: "suspeito",
+    confidence: "baixa",
+    categories: [],
+    explanations: ["Modo reserva: modelo indisponivel ou erro na chamada."],
+    source: "reserva",
   };
 
   // features automáticas
@@ -186,16 +176,6 @@ export async function gptPhishingScore(input: {
     body_text: input.body_text
   });
 
-  // ⚡ short-circuit benigno para casos Mercado Pago / grandes marcas
-  // Pode ser desativado com LLM_SKIP_SHORT_CIRCUIT=1 no .env (util para testar o GPT).
-  if (!SKIP_SHORT_CIRCUIT) {
-    const sc = shortCircuitVerdict(auto);
-    if (sc) {
-      console.info("[openai] short-circuit acionado (auth forte + dominios consistentes); GPT NAO chamado");
-      return sc;
-    }
-  }
-
   if (!client) {
     console.warn("[openai] sem client (sem OPENAI_API_KEY); usando fallback");
     return fallback;
@@ -205,7 +185,7 @@ export async function gptPhishingScore(input: {
   const system = [
     "Você é um classificador de phishing.",
     "Retorne SOMENTE JSON válido no schema pedido.",
-    "Use escala 0..1 para score; 0 = benigno, 1 = phishing claro.",
+    "Use escala 0..1 para score; 0 = legitimo, 1 = phishing claro.",
     "Considere fortes sinais de legitimidade quando DKIM/DMARC passarem e quando os domínios dos links forem consistentes com a marca do remetente.",
     "CDNs e assets (css/js/img/font) não devem ser penalizados.",
   ].join(" ");
@@ -237,11 +217,13 @@ export async function gptPhishingScore(input: {
           role: "user",
           content:
             "Classifique o e-mail a seguir. Regras:\n" +
-            "- score em [0,1]\n- label por threshold (>=0.75 phishing; 0.45-0.74 suspicious; <0.45 benign)\n" +
-            "- confidence: high (>=0.85), medium (0.6-0.84), low (<0.6)\n" +
+            "- score em [0,1]\n" +
+            "- label por threshold: >=0.75 phishing; 0.45-0.74 suspeito; <0.45 legitimo\n" +
+            "- confidence no JSON: qualquer valor valido; o servidor recalcula pela distancia ao meio (score perto de 0 ou de 1 = alta certeza no veredito).\n" +
             "- Considere legitimidade quando authStrong=true e familyMatchRatio alto\n" +
             "- Nao penalize links de asset/cdn/webfont\n" +
-            "- Preencha categories (brand_impersonation, credential_harvest, spoofing, extortion, malware, etc.)\n" +
+            "- Preencha categories com slugs em portugues, ex.: personificacao_marca, coleta_credenciais, " +
+            "falsificacao_remetente, extorsao, malware, golpe_fatura, premio_falso, pagamento_falso\n" +
             "- Explique em portugues, bullets curtas.\n\n" +
             "Dados JSON:\n" +
             JSON.stringify(userPayload),
@@ -257,8 +239,8 @@ export async function gptPhishingScore(input: {
             additionalProperties: false,
             properties: {
               score: { type: "number", minimum: 0, maximum: 1 },
-              label: { type: "string", enum: ["phishing", "suspicious", "benign"] },
-              confidence: { type: "string", enum: ["low", "medium", "high"] },
+              label: { type: "string", enum: ["phishing", "suspeito", "legitimo"] },
+              confidence: { type: "string", enum: ["baixa", "media", "alta"] },
               categories: { type: "array", items: { type: "string" } },
               explanations: { type: "array", items: { type: "string" }, minItems: 1 },
             },
@@ -271,18 +253,22 @@ export async function gptPhishingScore(input: {
     });
 
     raw = response.choices?.[0]?.message?.content ?? "";
-    const parsed = JSON.parse(raw) as LLMOutput;
+    const parsed = JSON.parse(raw) as {
+      score: number;
+      categories?: string[];
+      explanations?: string[];
+    };
     const score = Number.isFinite(parsed.score) ? Math.min(1, Math.max(0, parsed.score)) : 0.5;
     const label: ClassifierLabel =
-      score >= 0.75 ? "phishing" : score >= 0.45 ? "suspicious" : "benign";
-    const confidence: ClassifierConfidence =
-      score >= 0.85 ? "high" : score >= 0.6 ? "medium" : "low";
+      score >= 0.75 ? "phishing" : score >= 0.45 ? "suspeito" : "legitimo";
+    const confidence: ClassifierConfidence = scoreToConfidence(score);
     console.info("[openai] resposta GPT", { score, label, confidence });
+    const categoriesRaw = Array.isArray(parsed.categories) ? parsed.categories.slice(0, 10) : [];
     return {
       score,
       label,
       confidence,
-      categories: Array.isArray(parsed.categories) ? parsed.categories.slice(0, 10) : [],
+      categories: categoriesRaw.map((c) => normalizeCategorySlug(String(c))),
       explanations: Array.isArray(parsed.explanations)
         ? parsed.explanations.slice(0, 10)
         : ["classificacao sem explicacao"],

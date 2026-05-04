@@ -1,9 +1,15 @@
 import { Router } from "express";
 import { AnalyzeRequestSchema } from "../types.js";
 import { extractFeatures } from "../services/features.js";
-import { mlScore, rulesScore, type MLResult } from "../services/classifier.js";
-import { combineScores } from "../utils/scoring.js";
+import { mlScore, type MLResult } from "../services/classifier.js";
+import { finalizeFromMl } from "../utils/scoring.js";
 import { supabaseAdmin } from "../services/supabase.js";
+import { normalizeCategorySlug } from "../utils/taxonomy.js";
+import {
+  analyzedByToScansDb,
+  confidenceToScansDb,
+  labelToScansDb,
+} from "../utils/scansDbMapping.js";
 
 export const analyzeRouter = Router();
 
@@ -14,51 +20,32 @@ analyzeRouter.post("/", async (req, res, next) => {
     if (!user) return res.status(401).json({ error: "unauthenticated" });
 
     const feats = extractFeatures(parsed);
-    const [rScore, mResult] = await Promise.all([
-      rulesScore(parsed, feats),
-      mlScore(parsed, feats),
-    ]);
+    const mResult = await mlScore(parsed, feats);
+    const verdict = finalizeFromMl(mResult);
 
-    const combined = combineScores({
-      rules: rScore,
-      ml: mResult.score,
-      ml_label: mResult.label,
-    });
-
-    // Categorias: union(heuristicas, GPT) limitando a 10
-    const categories = mergeUnique(
-      inferCategories(feats),
-      mResult.categories,
-      10
-    );
-
-    // Explicacoes: GPT primeiro (mais ricas), depois heuristicas que ainda agreguem
-    const explanations = mergeUnique(
-      mResult.explanations.length ? mResult.explanations : buildExplanations(feats),
-      mResult.explanations.length ? buildExplanations(feats) : [],
-      10
-    );
+    const categories = mergeUnique([], mResult.categories, 10);
+    const explanations = mergeUnique(mResult.explanations, [], 10);
 
     const response = {
       result: {
-        label: combined.label,
-        score: Number(combined.score.toFixed(2)),
-        confidence: combined.confidence,
+        label: verdict.label,
+        score: Number(verdict.score.toFixed(2)),
+        confidence: verdict.confidence,
         categories,
         explanations,
-        disagreement: combined.disagreement,
+        disagreement: false,
       },
       breakdown: {
-        rules_score: Number(rScore.toFixed(3)),
+        rules_score: 0,
+        rules_label: null,
         ml_score: Number(mResult.score.toFixed(3)),
-        rules_label: combined.rules_label,
         ml_label: mResult.label ?? null,
         ml_confidence: mResult.confidence ?? null,
         analyzed_by: mResult.source,
       },
       features: feats,
       meta: {
-        model: "analyze-core@0.2.0",
+        model: "analyze-core@0.3.0",
         latency_ms: res.locals.__start ? Date.now() - res.locals.__start : undefined,
         trace_id: res.locals.__trace_id,
         user_id: user.id,
@@ -81,28 +68,11 @@ analyzeRouter.post("/", async (req, res, next) => {
   }
 });
 
-function inferCategories(f: any): string[] {
-  const cats: string[] = [];
-  if (f.domain_mismatch) cats.push("brand_impersonation");
-  if (f.urgency_terms > 0) cats.push("credential_harvest");
-  if (f.spf_fail || f.dmarc_none) cats.push("spoofing");
-  return Array.from(new Set(cats));
-}
-
-function buildExplanations(f: any): string[] {
-  const out: string[] = [];
-  if (f.domain_mismatch) out.push("Dominio nos links nao corresponde ao remetente");
-  if (f.spf_fail) out.push("SPF falhou");
-  if (f.dmarc_none) out.push("DMARC ausente/none");
-  if (f.urgency_terms > 0) out.push("Uso de linguagem de urgencia");
-  return out;
-}
-
 function mergeUnique(primary: string[], secondary: string[], limit: number): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   for (const item of [...primary, ...secondary]) {
-    const key = String(item ?? "").trim();
+    const key = normalizeCategorySlug(String(item ?? "").trim());
     if (!key) continue;
     const norm = key.toLowerCase();
     if (seen.has(norm)) continue;
@@ -110,7 +80,7 @@ function mergeUnique(primary: string[], secondary: string[], limit: number): str
     out.push(key);
     if (out.length >= limit) break;
   }
-  return out.length ? out : ["Nenhum sinal critico detectado"];
+  return out.length ? out : ["nenhum_sinal_critico"];
 }
 
 interface PersistArgs {
@@ -128,7 +98,7 @@ interface PersistArgs {
   breakdown: {
     rules_score: number;
     ml_score: number;
-    rules_label: string;
+    rules_label: string | null;
     ml_label: string | null;
     ml_confidence: string | null;
     analyzed_by: string;
@@ -155,22 +125,25 @@ async function persistScan({
       subject: payload?.email?.subject ?? null,
       from_address: payload?.email?.from ?? null,
       to_addresses: payload?.email?.to ?? null,
-      label: result.label,
+      label: labelToScansDb(result.label),
       score: result.score,
-      confidence: result.confidence,
+      confidence: confidenceToScansDb(result.confidence),
       categories: result.categories,
       explanations: result.explanations,
       features,
       raw_response: raw,
       source: payload?.context?.source ?? "gmail_extension",
-      // breakdown
       rules_score: breakdown.rules_score,
       ml_score: breakdown.ml_score,
-      gpt_label: mResult.source === "gpt" ? mResult.label ?? null : null,
-      gpt_confidence: mResult.source === "gpt" ? mResult.confidence ?? null : null,
+      gpt_label:
+        mResult.source === "gpt" && mResult.label != null ? labelToScansDb(mResult.label) : null,
+      gpt_confidence:
+        mResult.source === "gpt" && mResult.confidence != null
+          ? confidenceToScansDb(mResult.confidence)
+          : null,
       gpt_categories: mResult.source === "gpt" ? mResult.categories : [],
       gpt_explanations: mResult.source === "gpt" ? mResult.explanations : [],
-      analyzed_by: breakdown.analyzed_by,
+      analyzed_by: analyzedByToScansDb(mResult.source),
       disagreement: result.disagreement,
     },
     { onConflict: "user_id,gmail_message_id", ignoreDuplicates: false }
